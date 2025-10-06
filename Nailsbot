@@ -1,0 +1,316 @@
+import logging
+import sqlite3
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, executor, types
+
+### ========== CONFIG ==========
+BOT_TOKEN = "" #token
+OWNER_ID =   #id
+
+ADDRESS = "" #adress
+DB_PATH = "nails_bot.db" 
+
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+
+# ---------- Database helpers ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # таблица слотов
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS slots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,        -- YYYY-MM-DD
+        time TEXT NOT NULL,        -- HH:MM
+        datetime TEXT NOT NULL,    -- ISO combined for sorting
+        status TEXT NOT NULL,      -- 'free' or 'booked'
+        user_id INTEGER,
+        username TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def add_slot(date_str: str, time_str: str) -> int:
+    dt = f"{date_str} {time_str}"
+    iso = None
+    try:
+        iso = datetime.strptime(dt, "%Y-%m-%d %H:%M").isoformat()
+    except Exception:
+        raise ValueError("Неверный формат даты/времени")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO slots (date, time, datetime, status, created_at)
+      VALUES (?, ?, ?, 'free', ?)
+    """, (date_str, time_str, iso, datetime.utcnow().isoformat()))
+    conn.commit()
+    rowid = cur.lastrowid
+    conn.close()
+    return rowid
+
+
+def remove_slot(slot_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM slots WHERE id = ?", (slot_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return False
+    cur.execute("DELETE FROM slots WHERE id = ?", (slot_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def list_free_slots():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, date, time FROM slots WHERE status = 'free' ORDER BY datetime ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_slot(slot_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, date, time, status, user_id, username FROM slots WHERE id = ?", (slot_id,))
+    r = cur.fetchone()
+    conn.close()
+    return r
+
+
+def book_slot(slot_id: int, user_id: int, username: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM slots WHERE id = ?", (slot_id,))
+    r = cur.fetchone()
+    if not r or r[0] != 'free':
+        conn.close()
+        return False
+    cur.execute("UPDATE slots SET status = 'booked', user_id = ?, username = ? WHERE id = ?",
+                (user_id, username, slot_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def cancel_booking(slot_id: int, user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT status, user_id FROM slots WHERE id = ?", (slot_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return False
+    status, uid = r
+    if status != 'booked' or uid != user_id:
+        conn.close()
+        return False
+    cur.execute("UPDATE slots SET status = 'free', user_id = NULL, username = NULL WHERE id = ?", (slot_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def list_user_bookings(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, date, time FROM slots WHERE status = 'booked' AND user_id = ? ORDER BY datetime ASC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    text = (
+        .\n\n"
+        "Ниже — свободные окошки. Выберите удобное время:"
+    )
+    free = list_free_slots()
+    if not free:
+        await message.reply(text + "\n\nСейчас нет доступных слотов. Попробуйте позже или напишите /myslots, чтобы увидеть ваши записи.")
+        return
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for slot in free:
+        sid, date, time = slot
+        btn = types.InlineKeyboardButton(f"{date} {time}", callback_data=f"slot:{sid}")
+        kb.add(btn)
+    await message.reply(text, reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('slot:'))
+async def process_slot_callback(callback_query: types.CallbackQuery):
+    data = callback_query.data  # e.g. slot:3
+    slot_id = int(data.split(":", 1)[1])
+    slot = get_slot(slot_id)
+    if not slot:
+        await callback_query.answer("Этот слот не найден.", show_alert=True)
+        return
+    sid, date, time, status, uid, username = slot
+    if status != 'free':
+        await callback_query.answer("К сожалению, этот слот уже занят.", show_alert=True)
+        return
+
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm:{sid}"),
+        types.InlineKeyboardButton("❌ Отменить", callback_data="abort")
+    )
+    await bot.send_message(callback_query.from_user.id, f"Вы выбрали: {date} {time}\nПодтвердите запись:", reply_markup=kb)
+    await callback_query.answer()  # скрыть "..."
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('confirm:'))
+async def process_confirm(callback_query: types.CallbackQuery):
+    slot_id = int(callback_query.data.split(":", 1)[1])
+    user = callback_query.from_user
+    ok = book_slot(slot_id, user.id, user.username or user.full_name)
+    if not ok:
+        await callback_query.answer("Не удалось забронировать — возможно, кто-то успел раньше.", show_alert=True)
+        return
+    slot = get_slot(slot_id)
+    _, date, time, status, uid, username = slot
+
+    
+    await bot.send_message(user.id, f"✅ Запись подтверждена на {date} {time}!\n\nАдрес:\n{ADDRESS}")
+    await callback_query.answer("Запись оформлена.", show_alert=False)
+
+    
+    try:
+        await bot.send_message(OWNER_ID,
+                               f"Новая запись:\nКлиент: @{user.username or user.full_name} (id {user.id})\nВремя: {date} {time}\nСлот ID: {slot_id}")
+    except Exception as e:
+        logging.exception("Не удалось уведомить владельца.")
+
+
+@dp.callback_query_handler(lambda c: c.data == 'abort')
+async def process_abort(callback_query: types.CallbackQuery):
+    await callback_query.answer("Отменено.", show_alert=False)
+
+
+@dp.message_handler(commands=['addslot'])
+async def cmd_addslot(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.reply("Команда недоступна.")
+        return
+
+
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("Использование: /addslot YYYY-MM-DD HH:MM\nНапример: /addslot 2025-09-20 15:30")
+        return
+    parts = args.split()
+    if len(parts) != 2:
+        await message.reply("Неверный формат. Используйте: /addslot YYYY-MM-DD HH:MM")
+        return
+    date_str, time_str = parts
+    try:
+        slot_id = add_slot(date_str, time_str)
+        await message.reply(f"Слот добавлен: {date_str} {time_str}\nID = {slot_id}")
+    except Exception as e:
+        await message.reply(f"Ошибка при добавлении слота: {e}")
+
+
+
+@dp.message_handler(commands=['delslot'])
+async def cmd_delslot(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.reply("Команда недоступна.")
+        return
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("Использование: /delslot <slot_id>")
+        return
+    try:
+        slot_id = int(args)
+except ValueError:
+        await message.reply("slot_id должен быть числом.")
+        return
+    ok = remove_slot(slot_id)
+    if ok:
+        await message.reply(f"Слот {slot_id} удалён.")
+    else:
+        await message.reply("Слот не найден.")
+
+
+
+@dp.message_handler(commands=['myslots'])
+async def cmd_myslots(message: types.Message):
+    user_id = message.from_user.id
+    rows = list_user_bookings(user_id)
+    if not rows:
+        await message.reply("У вас нет активных записей.")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for sid, date, time in rows:
+        kb.add(types.InlineKeyboardButton(f"{date} {time} (ID {sid}) — Отменить", callback_data=f"cancel:{sid}"))
+    await message.reply("Ваши записи:", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cancel:'))
+async def process_cancel_callback(callback_query: types.CallbackQuery):
+    slot_id = int(callback_query.data.split(":", 1)[1])
+    user_id = callback_query.from_user.id
+    ok = cancel_booking(slot_id, user_id)
+    if not ok:
+        await callback_query.answer("Нельзя отменить этот слот (либо он не ваш, либо уже свободен).", show_alert=True)
+        return
+    await bot.send_message(user_id, f"Запись (ID {slot_id}) отменена.")
+    await callback_query.answer("Отменено.", show_alert=False)
+
+    # уведомить владельца
+    try:
+        await bot.send_message(OWNER_ID, f"Клиент @{callback_query.from_user.username or callback_query.from_user.full_name} отменил слот ID {slot_id}.")
+    except Exception:
+        pass
+
+
+@dp.message_handler(commands=['cancelrecord', 'canceltecord'])
+async def cmd_cancelrecord(message: types.Message):
+    user_id = message.from_user.id
+    rows = list_user_bookings(user_id)
+    if not rows:
+        await message.reply("У вас нет записей для отмены.")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for sid, date, time in rows:
+        kb.add(types.InlineKeyboardButton(f"Отменить {date} {time} (ID {sid})", callback_data=f"cancel:{sid}"))
+    await message.reply("Выберите запись для отмены:", reply_markup=kb)
+
+
+@dp.message_handler(commands=['help'])
+async def cmd_help(message: types.Message):
+    txt = (
+        "/start — начать и посмотреть свободные окошки\n"
+        "/myslots — показать мои записи\n"
+        "/cancelrecord или /canceltecord — отмена записи\n\n"
+        "Владелец:\n"
+        "/addslot YYYY-MM-DD HH:MM — добавить слот\n"
+        "/delslot <slot_id> — удалить слот\n"
+    )
+    await message.reply(txt)
+
+
+@dp.message_handler()
+async def fallback(message: types.Message):
+    await message.reply("Команда не распознана. Напиши /help для списка команд.")
+
+
+if name == '__main__':
+    init_db()
+    print("Bot started. Database initialized (if needed).")
+    executor.start_polling(dp, skip_updates=True)
