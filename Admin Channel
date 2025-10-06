@@ -1,0 +1,265 @@
+<dependencies>
+  <dependency>
+    <groupId>org.telegram</groupId>
+    <artifactId>telegrambots-longpolling</artifactId>
+    <version>6.9.7</version>
+  </dependency>
+  <dependency>
+    <groupId>org.telegram</groupId>
+    <artifactId>telegrambots-meta</artifactId>
+    <version>6.9.7</version>
+  </dependency>
+  <!-- логгер по желанию -->
+</dependencies>
+
+
+
+
+
+
+
+import org.telegram.telegrambots.meta.TelegramBotsApi;
+import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
+import org.telegram.telegrambots.meta.api.objects.Update;
+
+public class App {
+    public static void main(String[] args) throws Exception {
+        String token = System.getenv("BOT_TOKEN");
+        String channelIdEnv = System.getenv("CHANNEL_ID"); // -100...
+        if (token == null || channelIdEnv == null) {
+            throw new IllegalStateException("Set BOT_TOKEN and CHANNEL_ID env vars.");
+        }
+        long channelId = Long.parseLong(channelIdEnv);
+
+        TelegramBotsApi api = new TelegramBotsApi(DefaultBotSession.class);
+        ChannelManagerBot bot = new ChannelManagerBot(token, channelId);
+        api.registerBot(bot);
+        System.out.println("Bot started");
+    }
+}
+
+
+
+
+
+
+import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.Message;
+import org.telegram.telegrambots.meta.api.objects.Chat;
+import org.telegram.telegrambots.meta.api.methods.GetChat;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ChannelManagerBot extends TelegramLongPollingBot {
+    private final String token;
+    private final long channelId;
+    private Long discussionId;
+    private final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    // ======= In-memory store (replace with DB in prod) =======
+    private static class PostRec {
+        long msgId;
+        Long threadId; // message_thread_id в группе
+        String text;
+        Instant postedAt;
+        Instant deleteAt;
+    }
+    private final Map<Long, PostRec> posts = new ConcurrentHashMap<>(); // msgId -> rec
+    private final Map<Long, AtomicInteger> commentsByThread = new ConcurrentHashMap<>(); // threadId -> count
+
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+
+    public ChannelManagerBot(String token, long channelId) {
+        super(token);
+        this.token = token;
+        this.channelId = channelId;
+
+        // стараемся найти привязанную группу обсуждений при старте
+        scheduler.execute(() -> {
+            try {
+                GetChat getChat = new GetChat(String.valueOf(channelId));
+                Chat chat = execute(getChat);
+                this.discussionId = chat.getLinkedChatId(); // доступно в Bot API 5.0+
+                System.out.println("Linked discussion id: " + discussionId);
+            } catch (Exception e) {
+                System.err.println("Can't fetch linked_chat_id now: " + e.getMessage());
+            }
+        });
+    }
+
+    @Override public String getBotUsername() { return "channel_manager_bot"; }
+
+    // ================== COMMANDS ==================
+    @Override
+    public void onUpdateReceived(Update update) {
+        try {
+            if (update.hasMessage() && update.getMessage().hasText()) {
+                String text = update.getMessage().getText();
+                if (text.startsWith("/start")) {
+                    reply(update, "Готов. Команды:\n" +
+                            "/post <YYYY-MM-DD HH:MM> <текст>\n" +
+                            "/edit <message_id> <новый текст>\n" +
+                            "/delete <message_id>\n" +
+                            "/delete_after <message_id> <YYYY-MM-DD HH:MM>\n" +
+                            "/stats <DATE_FROM> <DATE_TO>");
+                    return;
+                }
+                if (text.startsWith("/post ")) {
+                    handlePost(update);
+                    return;
+                }
+                if (text.startsWith("/edit ")) {
+                    handleEdit(update);
+                    return;
+                }
+                if (text.startsWith("/delete_after ")) {
+                    handleDeleteAfter(update);
+                    return;
+                }
+                if (text.startsWith("/delete ")) {
+                    handleDelete(update);
+                    return;
+                }
+                if (text.startsWith("/stats ")) {
+                    handleStats(update);
+                    return;
+                }
+            }
+
+            // ===== Канал: ловим факты публикаций, если публиковал кто-то ещё
+            if (update.hasChannelPost()) {
+                Message m = update.getChannelPost();
+                PostRec rec = posts.computeIfAbsent((long)m.getMessageId(), id -> new PostRec());
+                rec.msgId = m.getMessageId();
+                rec.text = m.hasText()? m.getText() : (m.getCaption() != null? m.getCaption() : "");
+                rec.postedAt = Instant.ofEpochSecond(m.getDate());
+            }
+
+            // ===== Группа обсуждений: считаем комментарии и маппим thread_id
+            if (update.hasMessage()) {
+                Message m = update.getMessage();
+                if (discussionId != null && Objects.equals(m.getChatId(), discussionId)) {
+                    // Авто-форвард поста из канала => верхнее сообщение треда
+                    if (Boolean.TRUE.equals(m.getIsAutomaticForward())) {
+                        Integer srcMid = m.getForwardFromMessageId();
+                        if (srcMid != null) {
+                            PostRec rec = posts.computeIfAbsent(srcMid.longValue(), id -> new PostRec());
+                            rec.msgId = srcMid;
+                            rec.threadId = (long)m.getMessageId(); // thread id == id автофорварда
+                        }
+                        return;
+                    }
+                    // Обычный комментарий в треде
+                    if (m.getMessageThreadId() != null) {
+                        long thr = m.getMessageThreadId().longValue();
+                        commentsByThread.computeIfAbsent(thr, k -> new AtomicInteger()).incrementAndGet();
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void handlePost(Update u) throws TelegramApiException {
+        String[] parts = u.getMessage().getText().split(" ", 3);
+        if (parts.length < 3) { reply(u, "Формат: /post <YYYY-MM-DD HH:MM> <текст>"); return; }
+        Instant when = LocalDateTime.parse(parts[1] + " " + parts[2].split(" ")[0], TS).toInstant(ZoneOffset.UTC);
+        String text = u.getMessage().getText().substring(("/post " + parts[1] + " ").length());
+        long delay = Math.max(0, Duration.between(Instant.now(), when).toMillis());
+
+        scheduler.schedule(() -> {
+            try {
+                SendMessage sm = new SendMessage(String.valueOf(channelId), text);
+                Message m = execute(sm);
+                PostRec rec = posts.computeIfAbsent((long)m.getMessageId(), id -> new PostRec());
+                rec.msgId = m.getMessageId();
+                rec.text = text;
+                rec.postedAt = Instant.now();
+            } catch (TelegramApiException e) { e.printStackTrace(); }
+        }, delay, TimeUnit.MILLISECONDS);
+
+        reply(u, "Запланировано на " + when.toString() + " UTC");
+    }
+
+    private void handleEdit(Update u) throws TelegramApiException {
+        String[] parts = u.getMessage().getText().split(" ", 3);
+        if (parts.length < 3) { reply(u, "Формат: /edit <message_id> <новый текст>"); return; }
+        int msgId = Integer.parseInt(parts[1]);
+        String newText = parts[2];
+        EditMessageText em = new EditMessageText();
+        em.setChatId(String.valueOf(channelId));
+        em.setMessageId(msgId);
+        em.setText(newText);
+        execute(em);
+        PostRec rec = posts.get((long)msgId);
+        if (rec != null) rec.text = newText;
+        reply(u, "Готово: отредактировано.");
+    }
+
+    private void handleDelete(Update u) throws TelegramApiException {
+        String[] parts = u.getMessage().getText().split(" ", 2);
+        if (parts.length < 2) { reply(u, "Формат: /delete <message_id>"); return; }
+        int msgId = Integer.parseInt(parts[1]);
+        DeleteMessage dm = new DeleteMessage(String.valueOf(channelId), msgId);
+        execute(dm);
+        PostRec rec = posts.get((long)msgId);
+        if (rec != null) rec.deleteAt = Instant.now();
+        reply(u, "Удалено.");
+    }
+
+    private void handleDeleteAfter(Update u) throws TelegramApiException {
+        String[] parts = u.getMessage().getText().split(" ", 3);
+        if (parts.length < 3) { reply(u, "Формат: /delete_after <message_id> <YYYY-MM-DD HH:MM>"); return; }
+        int msgId = Integer.parseInt(parts[1]);
+        Instant when = LocalDateTime.parse(parts[2], TS).toInstant(ZoneOffset.UTC);
+        long delay = Math.max(0, Duration.between(Instant.now(), when).toMillis());
+        scheduler.schedule(() -> {
+            try { execute(new DeleteMessage(String.valueOf(channelId), msgId)); }
+            catch (TelegramApiException e) { e.printStackTrace(); }
+        }, delay, TimeUnit.MILLISECONDS);
+        reply(u, "Удаление запланировано на " + when.toString() + " UTC");
+    }
+
+    private void handleStats(Update u) throws TelegramApiException {
+        String[] parts = u.getMessage().getText().split(" ", 3);
+        if (parts.length < 3) { reply(u, "Формат: /stats <DATE_FROM> <DATE_TO> (YYYY-MM-DD)"); return; }
+        Instant from = LocalDate.parse(parts[1]).atStartOfDay(ZoneOffset.UTC).toInstant();
+        Instant to = LocalDate.parse(parts[2]).atStartOfDay(ZoneOffset.UTC).toInstant();
+
+        long postsCount = posts.values().stream()
+                .filter(p -> p.postedAt != null && !p.postedAt.isBefore(from) && !p.postedAt.isAfter(to))
+                .count();
+        long commentsCount = posts.values().stream()
+                .filter(p -> p.threadId != null)
+                .mapToLong(p -> commentsByThread.getOrDefault(p.threadId, new AtomicInteger()).get())
+                .sum();
+
+        // топ по обсуждаемости
+        List<String> top = posts.values().stream()
+                .filter(p -> p.postedAt != null && !p.postedAt.isBefore(from) && !p.postedAt.isAfter(to))
+                .sorted(Comparator.<PostRec>comparingInt(
+                        p -> -commentsByThread.getOrDefault(p.threadId, new AtomicInteger()).get()))
+                .limit(5)
+                .map(p -> "post_id " + p.msgId + ": " + commentsByThread.getOrDefault(p.threadId, new AtomicInteger()).get() + " коммент.")
+                .toList();
+
+        reply(u, "Постов: " + postsCount + "\nКомментарии: " + commentsCount +
+                "\nТоп-5:\n" + (top.isEmpty()? "—" : String.join("\n", top)));
+    }
+
+    private void reply(Update u, String text) throws TelegramApiException {
+        SendMessage sm = new SendMessage(String.valueOf(u.getMessage().getChatId()), text);
+        execute(sm);
+    }
+}
